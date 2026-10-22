@@ -1,6 +1,6 @@
 # Gluu Flex Upgrade Guide (Flex + Janssen + Admin UI)
 
-Last updated: 2026-10-23 · Author: Zico, Gluu Support
+Last updated: 2026-10-23 · Author: Zico, Gluu Support · Tested: Flex 6.4.0 to 6.5.1 · Script: `flex-k8s-upgrade.sh` v1.1.0
 
 ## Overview
 
@@ -13,6 +13,36 @@ On a VM, an in-place upgrade (section D) was tested from Flex 6.4.0 to 6.5.1 and
 | Kubernetes | `helm upgrade` with the `gluu-flex/gluu` chart | [Flex Helm upgrade](https://gluu.org/docs/flex/nightly/admin/kubernetes-ops/upgrade) |
 
 Components covered: Janssen Server (auth-server, config-api, fido2, scim), Flex (Admin UI, Casa) and the persistence layer (MySQL or PostgreSQL). Treat the target version's release notes as the authority on breaking changes.
+
+## Quick start: Kubernetes with the script
+
+For a Helm-based Flex install, [`flex-k8s-upgrade.sh`](../flex-k8s-upgrade.sh) does the tested procedure (section E): preflight, backup, image-tag bump, atomic `helm upgrade`, optional Agama redeploy, verification, and rollback hints. Run the dry run first; it takes the backup and runs `helm upgrade --dry-run` but changes nothing.
+
+```bash
+sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config -d    # dry run
+sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config \
+     -a agama-pw=agama-pw-gluu.gama -y                                                       # real run
+```
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `-v` | target chart version (required) | |
+| `-f` | current values file (required); a copy named `<values>-<version>.yaml` gets the new image tag | |
+| `-r`, `-n` | Helm release, namespace | `flex`, `gluu` |
+| `-c` | chart | `gluu-flex/gluu-all-in-one` |
+| `-t` | image tag | the target chart's default `image.tag` |
+| `-b` | backup root directory | `~/flex-upgrade-backups` |
+| `-p`, `-U`, `-D` | PostgreSQL pod, user, database | auto-detect, `postgres`, `gluu` |
+| `-s` | skip the database dump (external database: dump it yourself first) | off |
+| `-a NAME=FILE` | redeploy an Agama project archive afterwards (repeatable) | none |
+| `-k` | kubeconfig (also passed to Helm) | current context |
+| `-w` | rollout timeout | `900s` |
+| `-d` | dry run | off |
+| `-y` | no confirmation prompt | off |
+
+What it checks after the upgrade: `/.well-known/openid-configuration`, `/admin/` and `/admin/home/dashboard` return 200; the four Janssen WARs report the target version; PostgreSQL row counts (persons, clients, scopes) match the pre-upgrade counts.
+
+Not covered by the script: comparing files you mount over the image with the new image (it only lists them as a warning, see step 3 of section E), MySQL and external-database dumps, the production `gluu-flex/gluu` chart (per-service image tags), and VM installs. It was tested with a dry run and a same-version run on the test server; the real 6.4.0 to 6.5.1 upgrade followed the same steps by hand.
 
 ## Prerequisites
 
@@ -187,14 +217,7 @@ kubectl -n gluu rollout status deploy/flex-gluu-all-in-one
 - **Install script (quickstart):** passes the image tag `6.4.0-1` as the chart version, which does not exist; use `--version=6.4.0`. The ingress-nginx it installs has gzip off, which makes the Admin UI slow on long network paths. Enable `use-gzip` and brotli.
 - **Resources:** a 4 vCPU VM cannot run two all-in-one pods during a rolling update, so set the deployment strategy to `Recreate`.
 
-**Script.** `flex-k8s-upgrade.sh` runs steps 1, 2, 4, 5 and 6 above: backup, image-tag bump, atomic `helm upgrade`, Agama redeploy and checks, then prints rollback commands. Try `-d` (dry run) first:
-
-```bash
-sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config -d
-sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config -a agama-pw=agama-pw-gluu.gama -y
-```
-
-It was tested with a dry run and a same-version run on the test server. It does not do step 3 (comparing mounted files with the new image), so review the warning it prints. External databases need `-s` and your own dump.
+**Script.** The [quick start](#quick-start-kubernetes-with-the-script) automates steps 1, 2, 4, 5 and 6 above; step 3 stays manual.
 
 ## Post-upgrade validation
 
@@ -205,6 +228,8 @@ It was tested with a dry run and a same-version run on the test server. It does 
 - [ ] Existing users can authenticate; a sample of migrated users and clients exists.
 - [ ] Custom scripts and Agama flows run; no errors in `/opt/jans/jetty/jans-auth/logs` and `/var/log/adminui`.
 - [ ] Casa, SCIM and FIDO2 work if used.
+- [ ] Sign in to the Admin UI as a user that has the `jansAdminUIRole` attribute (for example `admin`). Any other account is signed out with "Your account does not have an Admin UI role".
+- [ ] Test authorization-code clients with a PKCE `code_challenge` (required by Flex 6.5.x).
 - [ ] Certificates, FQDN and external integrations (SPs, load balancer health checks) are correct.
 
 ## Rollback
@@ -225,6 +250,13 @@ The side-by-side design is the rollback: the old server stays untouched until yo
 | Admin login fails after data restore | Missing Admin UI role/permission entries or mismatched FQDN/client in config | Compare Admin UI entries in the database with the old server; re-check the Config API client |
 | Tokens or ID tokens rejected by clients | Signing keys differ from the old server | Copy the key material across or have clients refresh JWKS |
 | Custom login/script errors | Scripts not upgraded with the server | Review against the new version's APIs; check auth-server logs |
+| Admin UI sidebar is empty (Flex 6.4.0, Kubernetes all-in-one) | `GET /jans-config-api/api/v1/health/service-status` returns an empty body because the status script prints a Python warning | Mount a copy of `/opt/jans/bin/jans_services_status.py` with `warnings.filterwarnings("ignore")`; fixed upstream in 6.5.1 |
+| Admin UI shows 404 at `/admin/home/dashboard` after login | The image's nginx uses `try_files $uri $uri/ =404` | Mount a corrected `/etc/nginx/jans-aio/admin-ui-location.conf` falling back to `/admin/index.html` (still needed in 6.5.1) |
+| Admin UI "Signed Out: your account does not have an Admin UI role" | The user has no `jansAdminUIRole` | Sign in as `admin`, or assign a role to the user |
+| Authorization request fails with "PKCE is required but code_challenge is missing" | Flex 6.5.x requires PKCE | Add `code_challenge` and `code_challenge_method=S256` |
+| Admin UI hangs on "Redirecting..." after login | The slow first page load outlasts the 60 s authorization code lifetime | Serve from a closer region or CDN, enable gzip/brotli on the ingress; as a workaround raise `authorizationCodeLifetime` |
+| Admin UI loads slowly | Ingress-nginx has gzip off; long network path | Enable `use-gzip` and brotli; cache `/admin/assets/` |
+| Branding or custom login pages gone after the upgrade | The upgrade redeploys stock `agama-pw`; mounted files can hide new image files | Redeploy your Agama archive; re-compare mounted files |
 | Helm upgrade fails or pods crash-loop | Values file out of date for the new chart | Diff the chart defaults against `override.yaml`; `helm rollback` |
 
 Collect logs from `/opt/jans/jetty/*/logs`, `/var/log/adminui` and `kubectl logs` before asking support.

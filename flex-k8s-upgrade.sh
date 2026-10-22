@@ -3,6 +3,7 @@
 # PostgreSQL in the cluster, 6.4.0 -> 6.5.1). Backs up, bumps the image tag, upgrades, verifies, prints rollback.
 set -euo pipefail
 
+SCRIPT_VERSION=1.1.0
 RELEASE=flex
 NAMESPACE=gluu
 CHART=gluu-flex/gluu-all-in-one
@@ -42,6 +43,7 @@ Usage: $0 -v <chart-version> -f <values.yaml> [options]
   -w TIMEOUT     rollout timeout              (default: $TIMEOUT)
   -d             dry run: checks, backup, helm --dry-run only
   -y             do not ask for confirmation
+  -V             print the script version
   -h             this help
 EOF
 }
@@ -50,13 +52,13 @@ log()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
-while getopts "v:f:r:n:c:t:b:p:U:D:sa:k:w:dyh" o; do
+while getopts "v:f:r:n:c:t:b:p:U:D:sa:k:w:dyhV" o; do
   case $o in
     v) VERSION=$OPTARG;; f) VALUES=$OPTARG;; r) RELEASE=$OPTARG;; n) NAMESPACE=$OPTARG;;
     c) CHART=$OPTARG;; t) IMAGE_TAG=$OPTARG;; b) BACKUP_ROOT=$OPTARG;; p) DB_POD=$OPTARG;;
     U) DB_USER=$OPTARG;; D) DB_NAME=$OPTARG;; s) SKIP_DB=1;; a) AGAMA+=("$OPTARG");;
     k) KUBECTL+=(--kubeconfig "$OPTARG"); HELM+=(--kubeconfig "$OPTARG");;
-    w) TIMEOUT=$OPTARG;; d) DRY_RUN=1;; y) ASSUME_YES=1;; h) usage; exit 0;; *) usage; exit 2;;
+    w) TIMEOUT=$OPTARG;; d) DRY_RUN=1;; y) ASSUME_YES=1;; V) echo "flex-k8s-upgrade.sh $SCRIPT_VERSION"; exit 0;; h) usage; exit 0;; *) usage; exit 2;;
   esac
 done
 [[ -n $VERSION && -n $VALUES ]] || { usage; exit 2; }
@@ -66,7 +68,7 @@ k() { "${KUBECTL[@]}" -n "$NAMESPACE" "$@"; }
 h() { "${HELM[@]}" "$@"; }
 
 # ---------- preflight ----------
-log "Preflight"
+log "flex-k8s-upgrade.sh $SCRIPT_VERSION - preflight"
 command -v kubectl >/dev/null || die "kubectl not found"
 command -v helm    >/dev/null || die "helm not found"
 command -v python3 >/dev/null || die "python3 not found"

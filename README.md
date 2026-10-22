@@ -5,6 +5,8 @@ Notes and tooling for upgrading Gluu Flex (Janssen + Admin UI) from an older rel
 - [`docs/flex-upgrade-guide.md`](docs/flex-upgrade-guide.md): the upgrade guide (VM in-place and side-by-side, Admin UI only, Kubernetes), with the steps and findings from tests of Flex 6.4.0 to 6.5.1.
 - [`flex-k8s-upgrade.sh`](flex-k8s-upgrade.sh): script for the Helm upgrade (details below).
 
+Script version: 1.1.0 (`./flex-k8s-upgrade.sh -V`).
+
 Status: the guide and script come from a test environment (microk8s all-in-one chart, PostgreSQL; Ubuntu 24.04 VM). Read the "not tested" notes before using them on production.
 
 # flex-k8s-upgrade.sh
