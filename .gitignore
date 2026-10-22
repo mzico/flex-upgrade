@@ -1,0 +1,5 @@
+*.dump
+*.sql
+secret-*.yaml
+backup/
+flex-upgrade-backups/
