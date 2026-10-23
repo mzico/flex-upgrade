@@ -1,68 +1,86 @@
-# Gluu Flex Upgrade Guide (Flex + Janssen + Admin UI)
+# Gluu Flex upgrade guide
 
-Last updated: 2026-10-23 · Author: Zico, Gluu Support · Tested: Flex 6.4.0 to 6.5.1 · Script: `flex-k8s-upgrade.sh` v1.1.0
+How to upgrade a running **Gluu Flex** server (Janssen + Admin UI) from an older release to a newer one **without losing data**.
 
-## Overview
+> [!NOTE]
+> Last updated 2026-10-23 · Author: Zico, Gluu Support · Tested upgrade: **Flex 6.4.0 → 6.5.1** (Kubernetes and VM) · Script: `flex-k8s-upgrade.sh` v1.1.0
 
-On a VM, an in-place upgrade (section D) was tested from Flex 6.4.0 to 6.5.1 and keeps the existing database; the officially documented route is a side-by-side migration (section A), which is safer for production because the old server stays untouched. On Kubernetes you run `helm upgrade`. Admin UI can additionally be refreshed on its own with `flex_setup.py`.
+## Contents
 
-| Deployment | Upgrade method | Source |
+1. [What this guide covers](#what-this-guide-covers)
+2. [Pick your path](#pick-your-path)
+3. [Before you start (every path)](#before-you-start-every-path)
+4. [Path K: Kubernetes (Helm)](#path-k-kubernetes-helm)
+5. [Path V1: VM, in-place](#path-v1-vm-in-place)
+6. [Path V2: VM, side-by-side](#path-v2-vm-side-by-side)
+7. [Path V3: Admin UI only](#path-v3-admin-ui-only)
+8. [After the upgrade: verify](#after-the-upgrade-verify)
+9. [Rolling back](#rolling-back)
+10. [Problems you may hit](#problems-you-may-hit)
+11. [Glossary](#glossary)
+12. [Sources](#sources)
+
+---
+
+## What this guide covers
+
+A Flex server is made of three things. An upgrade replaces the first two and keeps the third:
+
+| Part | What it is | During an upgrade |
 | --- | --- | --- |
-| VM (Ubuntu, RHEL, SUSE) | In-place (section D, tested) or side-by-side: new VM, import config with Terraform, restore data, shift traffic (section A, not tested) | [Janssen VM upgrade](https://docs.jans.io/head/janssen-server/vm-ops/upgrade/) |
-| VM, Admin UI only | `flex_setup.py --update-admin-ui` | `flex_setup.py` source; Gluu support forum |
-| Kubernetes | `helm upgrade` with the `gluu-flex/gluu` chart | [Flex Helm upgrade](https://gluu.org/docs/flex/nightly/admin/kubernetes-ops/upgrade) |
+| **Application** | Janssen services (auth server, config API, SCIM, FIDO2) and Flex (Admin UI, Casa) | Replaced with the new version |
+| **Data** | Users, clients, scopes, settings, Admin UI roles, stored in PostgreSQL or MySQL | **Kept** (back it up first) |
+| **Your customizations** | Custom login pages, branding, Agama flows, scripts, mounted config files | **Re-check** after the upgrade; some are overwritten |
 
-Components covered: Janssen Server (auth-server, config-api, fido2, scim), Flex (Admin UI, Casa) and the persistence layer (MySQL or PostgreSQL). Treat the target version's release notes as the authority on breaking changes.
+Every path in this guide follows the same five steps:
 
-## Quick start: Kubernetes with the script
-
-For a Helm-based Flex install, [`flex-k8s-upgrade.sh`](../flex-k8s-upgrade.sh) does the tested procedure (section E): preflight, backup, image-tag bump, atomic `helm upgrade`, optional Agama redeploy, verification, and rollback hints. Run the dry run first; it takes the backup and runs `helm upgrade --dry-run` but changes nothing.
-
-```bash
-sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config -d    # dry run
-sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config \
-     -a agama-pw=agama-pw-gluu.gama -y                                                       # real run
+```mermaid
+flowchart LR
+    A["1. Back up<br/>database + config"] --> B["2. Upgrade<br/>replace the application"]
+    B --> C["3. Re-apply<br/>customizations"]
+    C --> D["4. Verify<br/>login, Admin UI, data"]
+    D --> E{"Everything OK?"}
+    E -- yes --> F["Done<br/>keep backups about a week"]
+    E -- no --> G["Roll back<br/>see Rolling back below"]
 ```
 
-| Option | Meaning | Default |
-| --- | --- | --- |
-| `-v` | target chart version (required) | |
-| `-f` | current values file (required); a copy named `<values>-<version>.yaml` gets the new image tag | |
-| `-r`, `-n` | Helm release, namespace | `flex`, `gluu` |
-| `-c` | chart | `gluu-flex/gluu-all-in-one` |
-| `-t` | image tag | the target chart's default `image.tag` |
-| `-b` | backup root directory | `~/flex-upgrade-backups` |
-| `-p`, `-U`, `-D` | PostgreSQL pod, user, database | auto-detect, `postgres`, `gluu` |
-| `-s` | skip the database dump (external database: dump it yourself first) | off |
-| `-a NAME=FILE` | redeploy an Agama project archive afterwards (repeatable) | none |
-| `-k` | kubeconfig (also passed to Helm) | current context |
-| `-w` | rollout timeout | `900s` |
-| `-d` | dry run | off |
-| `-y` | no confirmation prompt | off |
+## Pick your path
 
-What it checks after the upgrade: `/.well-known/openid-configuration`, `/admin/` and `/admin/home/dashboard` return 200; the four Janssen WARs report the target version; PostgreSQL row counts (persons, clients, scopes) match the pre-upgrade counts.
+Find your setup in the first column and follow the link.
 
-Not covered by the script: comparing files you mount over the image with the new image (it only lists them as a warning, see step 3 of section E), MySQL and external-database dumps, the production `gluu-flex/gluu` chart (per-service image tags), and VM installs. It was tested with a dry run and a same-version run on the test server; the real 6.4.0 to 6.5.1 upgrade followed the same steps by hand.
+| Your setup | Path | Tested by us? | Downtime | What you do |
+| --- | --- | --- | --- | --- |
+| Kubernetes, Helm chart | [**Path K**](#path-k-kubernetes-helm) | ✅ Yes (quickstart `gluu-all-in-one` chart) | about 2 minutes | Run a script, or `helm upgrade` by hand |
+| VM, one server, simplest | [**Path V1**](#path-v1-vm-in-place) | ✅ Yes (Ubuntu 24.04, PostgreSQL) | a few minutes | Install the new package, swap the application files |
+| VM, production, safest | [**Path V2**](#path-v2-vm-side-by-side) | ⚠️ No (documented by Janssen) | close to zero | Build a new server next to the old one, then move traffic |
+| Only the Admin UI changed | [**Path V3**](#path-v3-admin-ui-only) | ✅ Yes | seconds | One command |
 
-## Prerequisites
+> [!IMPORTANT]
+> Rehearse on a staging copy first. Treat the release notes of every version between yours and the target as the authority on breaking changes.
 
-- [ ] Source and target versions identified; release notes read for every version in between.
-- [ ] Staging environment on the same OS, database and version as production; the full procedure rehearsed there first.
-- [ ] Maintenance window agreed; the cutover is a traffic shift, so downtime can be near zero.
-- [ ] Inventory of customizations: custom Jython/Agama scripts, Agama projects, custom pages, `jans-auth` properties, Admin UI roles and custom plugins. Custom scripts are external configuration and are **not** updated by an upgrade; review each against the new version.
-- [ ] Inventory of clients, scopes, trusted IdPs, SAML trust relationships, and keys (JWKS) that external parties depend on.
-- [ ] Admin credentials, database credentials and a Terraform client ID/secret ready (the new server can create one with `setup.py -test-client-id` / `-test-client-pw`).
-- [ ] Database admin access and enough disk for a full dump.
-- [ ] Ports, FQDN and certificates for the new node; DNS TTL lowered before cutover.
+---
 
-## Backup
+## Before you start (every path)
 
-Take all of these before touching anything. A VM snapshot is the best single backup; the rest protects against a bad snapshot. Take at least one daily and one weekly backup.
+### Checklist
 
-**VM**
+- [ ] You know your **current** and **target** versions, and you read the release notes in between.
+- [ ] You have a **staging copy** (same OS, database and version) to rehearse on.
+- [ ] A **maintenance window** is agreed.
+- [ ] You listed your **customizations**: custom pages and branding, Agama projects, custom scripts, `jans-auth` properties, Admin UI roles. Upgrades do **not** update custom scripts.
+- [ ] You listed what **outside parties depend on**: clients, scopes, trusted IdPs, SAML trusts, signing keys (JWKS).
+- [ ] You have **database admin access** and enough disk for a full dump.
+- [ ] You have the **admin credentials**, and a way to reach the server (SSH or `kubectl`).
 
-1. Snapshot the VM (VMware, DigitalOcean, cloud provider).
-2. Stop Janssen services, archive, restart. The [Janssen backup page](https://docs.jans.io/head/janssen-server/vm-ops/backup/) lists `/opt`, `/etc/jans`, `/etc/apache2` and `/var/jans`:
+### Back up
+
+Take **all** of these before touching anything. A VM snapshot is the best single backup; the rest protects against a bad snapshot. Never put the secret backup in a ticket or a repository.
+
+<details>
+<summary><strong>VM backup commands</strong></summary>
+
+1. Snapshot the VM (VMware, DigitalOcean, your cloud provider).
+2. Stop the Janssen services, archive the files, start the services again. The [Janssen backup page](https://docs.jans.io/head/janssen-server/vm-ops/backup/) lists `/opt`, `/etc/jans`, `/etc/apache2` and `/var/jans`:
 
 ```bash
 sudo systemctl stop 'jans*'
@@ -70,9 +88,9 @@ sudo tar cvf jans-backup.tar /opt/jans /etc/jans /etc/apache2 /var/jans
 sudo systemctl start 'jans*'
 ```
 
-The docs print the stop/start commands as `systemctl stop list-units --all "jans*"`, which is not valid as written; verify that services actually stop.
+The Janssen docs print the stop and start commands as `systemctl stop list-units --all "jans*"`, which is not valid as written. Check that the services really stop.
 
-3. Dump the database (the docs do not cover this; use the native tool):
+3. Dump the database (the official docs do not cover this):
 
 ```bash
 # MySQL
@@ -83,183 +101,274 @@ pg_dump -U <user> -Fc jans > jans-$(date +%F).dump
 
 4. Save the Admin UI directory (`<apache root>/admin`) and `/var/log/adminui`.
 
-**Kubernetes** (from the [Janssen backup guide](https://docs.jans.io/head/janssen-server/kubernetes-ops/backup-restore/))
+</details>
+
+<details>
+<summary><strong>Kubernetes backup commands</strong> (from the <a href="https://docs.jans.io/head/janssen-server/kubernetes-ops/backup-restore/">Janssen backup guide</a>)</summary>
 
 ```bash
-kubectl get configmap cn -n <namespace> -o yaml > configmap-backup.yaml
-kubectl get secret cn -n <namespace> -o yaml > secret-backup.yaml
-helm get values <release> -n <namespace> > values.yaml
-helm list -n <namespace>   # record chart version
+kubectl -n <namespace> get cm cn -o yaml     > configmap-backup.yaml
+kubectl -n <namespace> get secret cn -o yaml > secret-backup.yaml
+helm get values <release> -n <namespace>     > values-live.yaml
+helm list -n <namespace>                       # note the chart version
+kubectl -n <namespace> exec <postgresql-pod> -- pg_dump -U postgres -Fc gluu > gluu-pre-upgrade.dump
 ```
 
-Also dump the external database as above. Keep backups off the host, and never put the secret backup in a ticket or repo.
+For an external database, dump it with its own tools. The Kubernetes script in Path K does all of this for you.
 
-## Upgrade procedure
+</details>
 
-The official docs describe the side-by-side flow and the Helm command but not data migration itself; the data steps below are the standard database approach and must be proven on staging first.
+---
 
-### A. VM: Janssen + Flex + Admin UI (side-by-side, documented, not tested)
+## Path K: Kubernetes (Helm)
 
-1. Keep the old VM running; do not decommission it.
-2. Provision a new VM on the supported OS and install Janssen at the target version from the VM install guide, then install Flex (Admin UI, Casa if used) at the matching Flex version using `flex_setup.py`. Create a Terraform test client during setup:
+**Use this if** Flex runs on Kubernetes from a Helm chart. **Tested on:** microk8s, chart `gluu-flex/gluu-all-in-one`, PostgreSQL in the cluster, 6.4.0 → 6.5.1. Result: data unchanged (12 persons, 10 clients, 195 scopes), all four Janssen components moved to 2.5.0, Admin UI, login pages and a custom Agama flow worked afterwards.
+
+> [!WARNING]
+> The production chart `gluu-flex/gluu` has not been tested. It uses one image tag per service, which the script does not edit.
+
+### K1. The quick way: use the script
+
+[`flex-k8s-upgrade.sh`](../flex-k8s-upgrade.sh) does the whole procedure and prints the rollback commands. **Always run the dry run first.** It takes the backup and runs `helm upgrade --dry-run` but changes nothing.
 
 ```bash
-sudo python3 /opt/jans/jans-setup/setup.py -test-client-id <client-id> -test-client-pw <client-pw>
+# 1. Dry run
+sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config -d
+
+# 2. Real run (add -a to redeploy your customized Agama project afterwards)
+sudo bash flex-k8s-upgrade.sh -v 6.5.1 -f override-6.4.0.yaml -k /root/.kube/config \
+     -a agama-pw=agama-pw-gluu.gama -y
 ```
 
-3. Carry configuration over with Terraform: `terraform import` the global configuration from the new server, then define and `terraform apply` your custom IdP configurations.
-4. Carry data over: stop writes on the old server (or schedule the window), take a fresh database dump, and restore it into the new server's database. Use the same engine (MySQL or PostgreSQL) and a database version supported by the target release. Restore users, clients, scopes, sessions you need to keep, and the Admin UI role/permission entries. Re-check that the keystore and `/etc/certs` material the old server used (signing keys, `jans-auth` JWKS) is copied if existing tokens and client trust must keep working.
-5. Review and port custom scripts and Agama projects to the new version; they are not upgraded automatically.
-6. Start both servers. Run the validation checks below against the new server using a hosts-file override of the production FQDN.
-7. Shift traffic gradually at the load balancer or DNS. When confident, drain and retire the old VM; keep its snapshot and dump for the rollback window.
+What the script does, in order:
 
-### B. Admin UI only (existing VM)
+| Step | What happens |
+| --- | --- |
+| Preflight | Checks the Helm release and the target chart exist; lists files you mounted over the image |
+| Image tag | Writes a copy of your values file (`<values>-<version>.yaml`) with the target chart's default `image.tag` |
+| Backup | ConfigMap and Secret `cn`, Helm values and history, your custom ConfigMaps, a `pg_dump` |
+| Dry run | `helm upgrade --dry-run` |
+| Upgrade | `helm upgrade --wait --atomic` (rolls back by itself if the pods never become ready) |
+| Agama | Redeploys the projects you list with `-a` |
+| Verify | Discovery, `/admin/`, `/admin/home/dashboard` return 200; WAR versions; database row counts before and after |
 
-Use this when only the Admin UI changes. Run as root on the Flex host:
+<details>
+<summary><strong>All script options</strong></summary>
 
-```bash
-# download flex_setup.py from the GluuFederation/flex repo for the target release
-sudo python3 flex_setup.py --update-admin-ui
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `-v` | target chart version (**required**) | |
+| `-f` | current values file (**required**) | |
+| `-r`, `-n` | Helm release, namespace | `flex`, `gluu` |
+| `-c` | chart | `gluu-flex/gluu-all-in-one` |
+| `-t` | image tag | the target chart's default `image.tag` |
+| `-b` | backup directory | `~/flex-upgrade-backups` |
+| `-p`, `-U`, `-D` | PostgreSQL pod, user, database | auto-detect, `postgres`, `gluu` |
+| `-s` | skip the database dump (you dump an external database yourself first) | off |
+| `-a NAME=FILE` | redeploy an Agama project archive afterwards (repeatable) | none |
+| `-k` | kubeconfig path (also passed to Helm) | current context |
+| `-w` | rollout timeout | `900s` |
+| `-d` | dry run | off |
+| `-y` | no confirmation prompt | off |
+| `-V`, `-h` | print version, print help | |
+
+</details>
+
+**Not covered by the script:** comparing the files you mount over the image with the new image (it only lists them, see K2 step 3), MySQL or external-database dumps, the production chart, and VM installs.
+
+### K2. The manual way (what the script automates)
+
+1. **Back up** (see [Before you start](#before-you-start-every-path)).
+2. **Update the image tag in your values file.** The chart version and the image tag are different numbers (chart `6.5.1`, image `6.5.1-1`). If your values pin `image.tag: 6.4.0-1`, the upgrade keeps running the old image. Find the default with:
+
+   ```bash
+   helm show values gluu-flex/gluu-all-in-one --version 6.5.1 | grep -A6 '^image:'
+   ```
+
+3. **Check every file you mount over the image.** A mounted file hides the new image's version of that file. Run a temporary pod from the new image, `cat` each file, and compare. In our test: the `login.xhtml` override was identical upstream (kept), the nginx file still needed our fix (kept), and the status script was fixed upstream (mount removed).
+4. **Upgrade:**
+
+   ```bash
+   helm repo update
+   helm upgrade flex gluu-flex/gluu-all-in-one -n gluu -f override-6.5.1.yaml --version=6.5.1
+   kubectl -n gluu rollout status deploy/flex-gluu-all-in-one
+   ```
+
+5. **Redeploy customized Agama projects.** The upgrade redeploys the stock `agama-pw` (and Casa), which overwrites custom branding. Deploy your archive again:
+
+   ```bash
+   curl -k -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/zip" \
+        --data-binary @agama-pw-gluu.gama \
+        "https://<fqdn>/jans-config-api/api/v1/agama-deployment/agama-pw?autoconfigure=false"
+   ```
+
+   A separate project (for example `gluu-terms`) is kept.
+6. **Verify** with [the checklist below](#after-the-upgrade-verify).
+
+---
+
+## Path V1: VM, in-place
+
+**Use this if** Flex runs on one VM and you accept a few minutes of downtime. **Tested on:** Ubuntu 24.04, PostgreSQL, Flex 6.4.0 → 6.5.1 (Janssen 2.4.0 → 2.5.0). Result: services, data, Admin UI and token issuance all worked; the database was not touched, so no restore was needed.
+
+> [!WARNING]
+> Janssen's own docs say VM deployments have no automatic upgrade and recommend [Path V2](#path-v2-vm-side-by-side). The in-place route below worked for this version pair. The database schema did not change between 6.4.0 and 6.5.1; check the release notes for other pairs.
+
+1. **Back up.** Database dump plus files:
+
+   ```bash
+   sudo -u postgres pg_dump -Fc jansdb > jansdb-6.4.0.dump
+   sudo systemctl stop 'jans*' apache2
+   sudo tar czf jans-6.4.0-files.tgz /opt/jans /etc/jans /etc/apache2 /var/jans /var/www/html/admin /etc/certs
+   sudo systemctl start apache2 jans-auth jans-config-api jans-scim jans-fido2
+   ```
+
+2. **Install the new Flex package** over the old one. Download the `.deb` for your OS from the Flex release page and verify its SHA-256. The package stops the Janssen services and replaces the setup scripts and `app_info.json` (here Janssen 2.4.0 → 2.5.0), but it does **not** replace the running Janssen applications:
+
+   ```bash
+   sudo apt-get install -y ./flex_6.5.1-stable.ubuntu24.04_amd64.deb
+   ```
+
+3. **Stage the new Janssen files.** `install.py -upgrade` only copies what is already in `/opt/dist/jans`. If those files are still the old version, it silently reinstalls the old WARs. In our test `setup.py --download-exit` did not fetch them and stopped on a 404, so download them from the Janssen GitHub release and check the version:
+
+   ```bash
+   cd /opt/dist/jans
+   V=2.5.0; B=https://github.com/JanssenProject/jans/releases/download/v$V
+   for p in jans-auth-server:jans-auth jans-scim-server:jans-scim jans-fido2-server:jans-fido2 jans-config-api-server:jans-config-api; do
+     sudo wget -O ${p#*:}.war $B/${p%:*}-$V.war
+     unzip -p ${p#*:}.war META-INF/MANIFEST.MF | grep Implementation-Version
+   done
+   ```
+
+4. **Replace the applications.** The old WARs are kept as `*.war-back.<date>` for rollback:
+
+   ```bash
+   cd /opt/jans/jans-setup && sudo python3 install.py -upgrade -use-downloaded -yes
+   ```
+
+5. **Update the Admin UI:**
+
+   ```bash
+   sudo python3 /opt/jans/jans-setup/flex/flex-linux-setup/flex_setup.py --update-admin-ui
+   ```
+
+   The old Admin UI directory is kept as `/var/www/html/admin.back-<timestamp>`.
+6. **Verify** with [the checklist below](#after-the-upgrade-verify).
+
+Not handled by `-upgrade`: components installed from other packages (Jetty, Jython, Java) and services not listed above (Casa, Lock, Link). Upgrade those separately. Custom scripts are never changed.
+
+---
+
+## Path V2: VM, side-by-side
+
+**Use this if** this is production and you want the old server untouched until you are sure. **Status:** documented by [Janssen](https://docs.jans.io/head/janssen-server/vm-ops/upgrade/), **not tested by us**. The old server **is** the rollback.
+
+```mermaid
+flowchart LR
+    U["Users"] --> LB["Load balancer / DNS"]
+    LB -- "100% at first" --> OLD["Old VM<br/>(untouched)"]
+    LB -. "shift gradually" .-> NEW["New VM<br/>target version"]
+    NEW --> DB[("Restored database copy")]
 ```
 
-What the script does (read from its source): checks that `<apache root>/admin` exists, re-downloads the Flex and Admin UI artifacts, replaces `admin-ui-plugin.jar` in Config API, renames the current admin directory to a timestamped `...back-<timestamp>` copy, unpacks the new build, then restarts Apache, `jans-auth` and Config API. The timestamped copy is your quick Admin UI rollback. The flag is documented in the \[VM install guide\](https://gluu.org/head/install/vm-install/ubuntu); the script lives at \`/opt/jans/jans-setup/flex/flex-linux-setup/flex\_setup.py\`. See also a [support forum reply](https://support.gluu.org/upgrade/11365/flex-upgrade-from-500-4-to-50014).
+1. Keep the old VM running. Do not decommission it.
+2. Provision a new VM and install Janssen, then Flex (Admin UI, Casa if used), at the **target** version. Create a Terraform test client during setup:
 
-### C. Kubernetes (Helm, not tested)
+   ```bash
+   sudo python3 /opt/jans/jans-setup/setup.py -test-client-id <client-id> -test-client-pw <client-pw>
+   ```
 
-```bash
-helm ls -n <namespace>                      # find the release name and current chart version
-helm get values <release> -n <namespace> > override.yaml   # start from your current values
-# edit override.yaml: image tags / chart-specific changes for the target version
-helm upgrade <release> gluu-flex/gluu -n <namespace> -f override.yaml --version=<target-chart-version>
-```
+3. Carry the configuration over with Terraform: `terraform import` the global configuration from the new server, then define and `terraform apply` your custom IdP configurations.
+4. Carry the data over: stop writes on the old server (or pick a window), take a fresh database dump, and restore it into the new server's database. Use the same engine and a database version supported by the target release. Copy the keystore and `/etc/certs` material (signing keys, `jans-auth` JWKS) if existing tokens and client trust must keep working.
+5. Review and port custom scripts and Agama projects. They are not upgraded automatically.
+6. Start both servers and run [the checklist](#after-the-upgrade-verify) against the new one using a hosts-file override of the production FQDN.
+7. Shift traffic gradually at the load balancer or DNS. When you are confident, drain the old VM. Keep its snapshot and dump for the rollback window.
 
-The chart repo `gluu-flex` must already be added (`helm repo update` first). Use the Flex chart (`gluu-flex/gluu`), not `janssen/janssen`, so Janssen and Flex move together. Persistence is external (MySQL/PostgreSQL), so data is retained; back up before the upgrade.
+---
 
-### D. Tested: in-place VM upgrade, Flex 6.4.0 to 6.5.1 (Ubuntu 24.04, PostgreSQL)
+## Path V3: Admin UI only
 
-Tested 2026-10-21 on a single VM with Janssen 2.4.0 / Flex 6.4.0 and Admin UI, seeded with 10 users, 3 clients and 2 scopes. Result: services, data, Admin UI and token issuance all worked after the upgrade, with no database restore needed. The database was not touched by any step, so the schema was unchanged between these two releases; check release notes before relying on this for other version pairs.
-
-1. **Back up** (before anything else):
-
-```bash
-sudo -u postgres pg_dump -Fc jansdb > jansdb-6.4.0.dump
-sudo systemctl stop 'jans*' apache2
-sudo tar czf jans-6.4.0-files.tgz /opt/jans /etc/jans /etc/apache2 /var/jans /var/www/html/admin /etc/certs
-sudo systemctl start apache2 jans-auth jans-config-api jans-scim jans-fido2
-```
-
-2. **Install the new Flex package** over the old one. Download the `.deb` for your OS from the Flex release page and verify its SHA-256. The package's `prerm` stops the Janssen services on upgrade; it replaces the setup scripts and `app_info.json` (here Janssen 2.4.0 to 2.5.0) but does not replace the running Janssen applications:
-
-```bash
-sudo apt-get install -y ./flex_6.5.1-stable.ubuntu24.04_amd64.deb
-```
-
-3. **Stage the new Janssen artifacts.** `install.py -upgrade` only copies the files already in `/opt/dist/jans`; if those are still the old version it silently re-installs the old WARs. In our test `setup.py --download-exit` did not fetch the core WARs and aborted on a 404 for the Shibboleth WAR, so download them from the Janssen GitHub release and check the manifest version:
-
-```bash
-cd /opt/dist/jans
-V=2.5.0; B=https://github.com/JanssenProject/jans/releases/download/v$V
-for p in jans-auth-server:jans-auth jans-scim-server:jans-scim jans-fido2-server:jans-fido2 jans-config-api-server:jans-config-api; do
-  sudo wget -O ${p#*:}.war $B/${p%:*}-$V.war
-  unzip -p ${p#*:}.war META-INF/MANIFEST.MF | grep Implementation-Version
-done
-```
-
-4. **Replace the applications.** Existing WARs are kept as `*.war-back.<date>` for rollback:
-
-```bash
-cd /opt/jans/jans-setup && sudo python3 install.py -upgrade -use-downloaded -yes
-```
-
-5. **Update Admin UI:**
+**Use this if** only the Admin UI changes on an existing VM. **Tested:** yes. Run as root on the Flex host (download `flex_setup.py` from the `GluuFederation/flex` repo for the target release first):
 
 ```bash
 sudo python3 /opt/jans/jans-setup/flex/flex-linux-setup/flex_setup.py --update-admin-ui
 ```
 
-The old Admin UI directory is kept as `/var/www/html/admin.back-<timestamp>`.
+What it does (read from the script's source): checks that `<apache root>/admin` exists, re-downloads the Flex and Admin UI files, replaces `admin-ui-plugin.jar` in the Config API, renames the current admin directory to `...back-<timestamp>`, unpacks the new build, then restarts Apache, `jans-auth` and the Config API. The timestamped copy is your quick Admin UI rollback.
 
-6. **Validate:** all five services active; `Implementation-Version` of each WAR equals the target; discovery, JWKS and `/admin/` return 200; a `client_credentials` token is issued for a seeded client; the Config API still lists the seeded users.
+---
 
-Not covered by `-upgrade`: components installed from other packages (Jetty, Jython, Java) and any Janssen services not listed above (for example Casa, Lock, Link); upgrade those separately. Custom scripts are not changed.
+## After the upgrade: verify
 
-### E. Tested: Kubernetes (microk8s, all-in-one chart), Flex 6.4.0 to 6.5.1
+Run through this list on every path.
 
-Tested 2026-10-22 on a 4 vCPU / 16 GB Ubuntu 24.04 VM with PostgreSQL. Result: data (12 users, 10 clients, 195 scopes) was unchanged, all four Janssen components moved to 2.5.0, and the Admin UI, login pages and a custom Agama flow worked afterward. The upgrade itself took about 2 minutes of downtime (Recreate strategy). This test used the quickstart chart `gluu-flex/gluu-all-in-one`, release `flex`, namespace `gluu`; the production chart `gluu-flex/gluu` (section C) was not tested.
+- [ ] **Services are up:** `systemctl status 'jans*' apache2` (VM) or `kubectl get pods -n <namespace>` (Kubernetes).
+- [ ] **Versions:** each Janssen WAR reports the target version (`unzip -p <war> META-INF/MANIFEST.MF | grep Implementation-Version`).
+- [ ] **Discovery works:** `curl -s https://<fqdn>/.well-known/openid-configuration`, and the JWKS endpoint returns your keys.
+- [ ] **Admin UI loads and the sidebar shows.** Sign in as a user that has the `jansAdminUIRole` attribute (for example `admin`). Any other account is signed out with "Your account does not have an Admin UI role".
+- [ ] **Authorization code flow works** with a real client, including token and userinfo calls. Flex 6.5.x requires a PKCE `code_challenge`.
+- [ ] **Data matches:** users, clients and scopes are the same as before (compare row counts or spot-check).
+- [ ] **Customizations:** login pages, branding, Agama flows and custom scripts still work; no errors in `/opt/jans/jetty/jans-auth/logs`, `/var/log/adminui` or `kubectl logs`.
+- [ ] **Casa, SCIM, FIDO2** work if you use them.
+- [ ] **Certificates, FQDN and integrations** (service providers, load balancer health checks) are correct.
 
-1. **Back up first.** ConfigMap and Secret `cn`, the Helm values, and the database (here the PostgreSQL pod):
+---
 
-```bash
-kubectl -n gluu get cm cn -o yaml > configmap-backup.yaml
-kubectl -n gluu get secret cn -o yaml > secret-backup.yaml
-helm get values flex -n gluu > values-live.yaml
-kubectl -n gluu exec <postgresql-pod> -- pg_dump -U postgres -Fc gluu > gluu-pre-upgrade.dump
-```
+## Rolling back
 
-2. **Update the image tag in your values file.** The chart version and the image tag differ (chart `6.5.1`, image `6.5.1-1`). If your values pin `image.tag: 6.4.0-1`, the upgrade keeps running the old image. Find the default with `helm show values gluu-flex/gluu-all-in-one --version 6.5.1 | grep -A6 '^image:'`.
-3. **Review your customizations against the new image.** Every file you mount over an image file hides the new version of that file. Compare each one before upgrading (run a temporary pod from the new image and `cat` the file): in our case the `login.xhtml` override was identical upstream, the nginx file still needed our Admin UI fix, and the status script was fixed upstream, so we dropped that mount.
-4. **Upgrade the release:**
+| Path | How to go back |
+| --- | --- |
+| **K** (Kubernetes) | `helm rollback <release> <revision> -n <namespace> --wait` (find the revision with `helm history`). If the new version changed the database, restore the pre-upgrade dump, then the saved ConfigMap and Secret. The script prints the exact commands. |
+| **V1** (VM in-place) | Restore the VM snapshot, or put the `*.war-back.<date>` files back and restart the services. |
+| **V2** (side-by-side) | Point traffic back to the old VM. Do not restore the old database dump over data created on the new server without deciding what to do with the changes in between. |
+| **V3** (Admin UI only) | Stop Apache, move the new admin directory aside, rename `...back-<timestamp>` back to the admin path, restore the previous `admin-ui-plugin.jar`, restart Apache, `jans-auth` and the Config API. |
 
-```bash
-helm repo update
-helm upgrade flex gluu-flex/gluu-all-in-one -n gluu -f override-6.5.1.yaml --version=6.5.1
-kubectl -n gluu rollout status deploy/flex-gluu-all-in-one
-```
+Keep snapshots, dumps and the old server for an agreed window (at least a week) before deleting them.
 
-5. **Redeploy customized Agama projects.** The upgrade redeploys the stock `agama-pw` (and Casa), which overwrites custom branding in `agama-pw`. Deploy your project archive again with `POST /jans-config-api/api/v1/agama-deployment/agama-pw?autoconfigure=false` (`Content-Type: application/zip`). A separate project such as `gluu-terms` is kept.
-6. **Validate** as in section D, plus: sign in to the Admin UI and confirm the sidebar, and run an authorization-code request with a PKCE `code_challenge`.
+---
 
-**Findings that affect other installs**
+## Problems you may hit
 
-- **Fixed upstream in 6.5.1:** the status script warning (6.4.0 returned an empty `/api/v1/health/service-status`, which left the Admin UI sidebar empty). On 6.4.0 patch `jans_services_status.py` to ignore warnings.
-- **Still present in 6.5.1:** the image's nginx serves the Admin UI with `try_files ... =404`, so the post-login URL `/admin/home/dashboard` returns 404. Mount a corrected `/etc/nginx/jans-aio/admin-ui-location.conf` with `try_files $uri $uri/ /admin/index.html;`.
-- **Behavior change in 6.5.1:** authorization requests without `code_challenge` fail with "PKCE is required but code\_challenge is missing". Update clients and test URLs.
-- **Install script (quickstart):** passes the image tag `6.4.0-1` as the chart version, which does not exist; use `--version=6.4.0`. The ingress-nginx it installs has gzip off, which makes the Admin UI slow on long network paths. Enable `use-gzip` and brotli.
-- **Resources:** a 4 vCPU VM cannot run two all-in-one pods during a rolling update, so set the deployment strategy to `Recreate`.
+Search this table for your symptom. "Seen in" tells you which versions and paths it applies to.
 
-**Script.** The [quick start](#quick-start-kubernetes-with-the-script) automates steps 1, 2, 4, 5 and 6 above; step 3 stays manual.
-
-## Post-upgrade validation
-
-- [ ] All services up: `systemctl status 'jans*' apache2` (VM) or `kubectl get pods -n <namespace>` (K8s).
-- [ ] OpenID discovery responds: `curl -s https://<fqdn>/.well-known/openid-configuration`, and the JWKS endpoint returns the expected keys.
-- [ ] Admin UI loads, you can log in, and roles, clients and scopes match the old server.
-- [ ] Authorization code flow with a real client completes, including token and userinfo calls.
-- [ ] Existing users can authenticate; a sample of migrated users and clients exists.
-- [ ] Custom scripts and Agama flows run; no errors in `/opt/jans/jetty/jans-auth/logs` and `/var/log/adminui`.
-- [ ] Casa, SCIM and FIDO2 work if used.
-- [ ] Sign in to the Admin UI as a user that has the `jansAdminUIRole` attribute (for example `admin`). Any other account is signed out with "Your account does not have an Admin UI role".
-- [ ] Test authorization-code clients with a PKCE `code_challenge` (required by Flex 6.5.x).
-- [ ] Certificates, FQDN and external integrations (SPs, load balancer health checks) are correct.
-
-## Rollback
-
-The side-by-side design is the rollback: the old server stays untouched until you retire it.
-
-- **VM:** point traffic back to the old VM. If it was stopped, start its services; restore the VM snapshot if its files changed. Do not restore the old database dump over data created on the new server without deciding what to do with the changes in between.
-- **Admin UI only:** stop Apache, move the new admin directory aside, rename the `...back-<timestamp>` directory back to the admin path, restore the previous `admin-ui-plugin.jar`, restart Apache, `jans-auth` and Config API.
-- **Kubernetes:** `helm rollback <release> <revision> -n <namespace>` (find the revision with `helm history`). If the database was changed by the new version, restore the pre-upgrade dump, then the saved ConfigMap and Secret.
-- Keep snapshots, dumps and the old VM for an agreed window (suggest at least one week) before deleting.
-
-## Troubleshooting
-
-| Symptom | Likely cause | Action |
-| --- | --- | --- |
-| `Gluu Flex Admin UI was not installed on this system. Update not possible.` | `<apache root>/admin` missing | Install Admin UI with `flex_setup.py --install-admin-ui` instead of updating |
-| Admin UI shows old version after update | Browser cache, or Apache not restarted | Hard refresh; restart Apache, `jans-auth`, Config API |
-| Admin login fails after data restore | Missing Admin UI role/permission entries or mismatched FQDN/client in config | Compare Admin UI entries in the database with the old server; re-check the Config API client |
-| Tokens or ID tokens rejected by clients | Signing keys differ from the old server | Copy the key material across or have clients refresh JWKS |
-| Custom login/script errors | Scripts not upgraded with the server | Review against the new version's APIs; check auth-server logs |
-| Admin UI sidebar is empty (Flex 6.4.0, Kubernetes all-in-one) | `GET /jans-config-api/api/v1/health/service-status` returns an empty body because the status script prints a Python warning | Mount a copy of `/opt/jans/bin/jans_services_status.py` with `warnings.filterwarnings("ignore")`; fixed upstream in 6.5.1 |
-| Admin UI shows 404 at `/admin/home/dashboard` after login | The image's nginx uses `try_files $uri $uri/ =404` | Mount a corrected `/etc/nginx/jans-aio/admin-ui-location.conf` falling back to `/admin/index.html` (still needed in 6.5.1) |
-| Admin UI "Signed Out: your account does not have an Admin UI role" | The user has no `jansAdminUIRole` | Sign in as `admin`, or assign a role to the user |
-| Authorization request fails with "PKCE is required but code_challenge is missing" | Flex 6.5.x requires PKCE | Add `code_challenge` and `code_challenge_method=S256` |
-| Admin UI hangs on "Redirecting..." after login | The slow first page load outlasts the 60 s authorization code lifetime | Serve from a closer region or CDN, enable gzip/brotli on the ingress; as a workaround raise `authorizationCodeLifetime` |
-| Admin UI loads slowly | Ingress-nginx has gzip off; long network path | Enable `use-gzip` and brotli; cache `/admin/assets/` |
-| Branding or custom login pages gone after the upgrade | The upgrade redeploys stock `agama-pw`; mounted files can hide new image files | Redeploy your Agama archive; re-compare mounted files |
-| Helm upgrade fails or pods crash-loop | Values file out of date for the new chart | Diff the chart defaults against `override.yaml`; `helm rollback` |
+| Symptom | Cause | Fix | Seen in |
+| --- | --- | --- | --- |
+| Upgrade finishes but the old version is still running | Values file still pins the old `image.tag` | Update `image.tag` (the script does it for you) | K |
+| `helm install` fails: chart `6.4.0-1` not found | The quickstart script passes the **image tag** as the chart version | Use `--version=6.4.0` | K quickstart script |
+| Rolling update hangs, new pod stays `Pending` | A 4 vCPU node cannot run two all-in-one pods at once | Set the deployment strategy to `Recreate` | K |
+| Admin UI sidebar is empty | `GET /jans-config-api/api/v1/health/service-status` returns an empty body, because the status script prints a Python warning | Mount a copy of `/opt/jans/bin/jans_services_status.py` that ignores warnings; **fixed upstream in 6.5.1** | K, Flex 6.4.0 |
+| Admin UI shows nginx 404 at `/admin/home/dashboard` after login | The image's nginx uses `try_files $uri $uri/ =404;` | Mount a corrected `/etc/nginx/jans-aio/admin-ui-location.conf` with `try_files $uri $uri/ /admin/index.html;` (**still needed in 6.5.1**) | K, 6.4.0 and 6.5.1 |
+| "Signed Out: your account does not have an Admin UI role" | The user has no `jansAdminUIRole` | Sign in as `admin`, or assign a role to the user | all |
+| "PKCE is required but code_challenge is missing" | Flex 6.5.x requires PKCE for authorization code requests | Add `code_challenge` and `code_challenge_method=S256` | 6.5.x |
+| Branding or custom login pages disappeared | The upgrade redeploys the stock `agama-pw`; files you mounted can also hide new image files | Redeploy your Agama archive; re-compare mounted files | K |
+| Old WARs are back after `install.py -upgrade` | `/opt/dist/jans` still held the old files | Stage the new WARs first (V1 step 3) and check their version | V1 |
+| `setup.py --download-exit` stops on a 404 (Shibboleth WAR) | The 2.5.0 release has no such file | Download the four core WARs by hand (V1 step 3) | V1, 6.5.1 |
+| `Gluu Flex Admin UI was not installed on this system. Update not possible.` | `<apache root>/admin` is missing | Install with `flex_setup.py --install-admin-ui` instead | V3 |
+| Admin UI shows the old version after an update | Browser cache, or services not restarted | Hard refresh; restart Apache, `jans-auth` and the Config API | V1, V3 |
+| Admin UI loads very slowly | Ingress-nginx has gzip off (quickstart default); long network path | Enable `use-gzip` and brotli on ingress-nginx; cache `/admin/assets/`; host close to your users | K |
+| Admin UI hangs on "Redirecting..." after login | The first page load takes longer than the 60 s authorization code lifetime | Fix the slow load (above); as a workaround raise `authorizationCodeLifetime` | K, slow links |
+| Admin login fails after a data restore | Admin UI role entries missing, or FQDN/client mismatch | Compare the Admin UI entries in the database with the old server | V2 |
+| Clients reject tokens after the move | Signing keys differ from the old server | Copy the key material, or have clients refresh JWKS | V2 |
+| Custom login or script errors | Scripts are not upgraded with the server | Review them against the new version's APIs; check the auth-server logs | all |
+| `helm upgrade` fails or pods crash-loop | Values file out of date for the new chart | Diff the chart defaults against your values; `helm rollback` | K |
 
 Collect logs from `/opt/jans/jetty/*/logs`, `/var/log/adminui` and `kubectl logs` before asking support.
+
+---
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| **Janssen** | The open-source identity server underneath Flex (auth server, config API, SCIM, FIDO2) |
+| **Flex** | Gluu's distribution: Janssen plus the Admin UI and Casa |
+| **Admin UI** | The web console at `/admin` |
+| **Agama** | The flow engine behind login pages (`agama-pw` is the password login flow, used by the Admin UI) |
+| **Helm chart / release** | The Kubernetes package (chart) and one installed copy of it (release) |
+| **Chart version vs image tag** | Two different numbers: chart `6.5.1` deploys image `6.5.1-1` |
+| **PKCE** | An extra check on the authorization code flow; Flex 6.5.x makes it mandatory |
+| **JWKS** | The public signing keys that clients use to verify tokens |
+| **WAR** | The packaged Java web application for one Janssen service |
 
 ## Sources
 
@@ -267,5 +376,6 @@ Collect logs from `/opt/jans/jetty/*/logs`, `/var/log/adminui` and `kubectl logs
 - [Janssen VM backup](https://docs.jans.io/head/janssen-server/vm-ops/backup/)
 - [Janssen Kubernetes backup and restore](https://docs.jans.io/head/janssen-server/kubernetes-ops/backup-restore/)
 - [Flex Helm upgrade (nightly)](https://gluu.org/docs/flex/nightly/admin/kubernetes-ops/upgrade)
+- [Flex VM install on Ubuntu](https://gluu.org/head/install/vm-install/ubuntu)
 - [Support forum: Flex upgrade, Admin UI update](https://support.gluu.org/upgrade/11365/flex-upgrade-from-500-4-to-50014)
 - `flex_setup.py` in the GluuFederation/flex repo (`--update-admin-ui` behavior)
